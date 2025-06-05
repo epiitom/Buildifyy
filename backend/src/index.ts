@@ -12,7 +12,7 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY, 
 });
 
-app.get("/template",async (req:Request, res:Response) => {
+app.post("/template",async (req:Request, res:Response) => {
     const prompt = req.body.prompt;
    
     const response = await client.chat.completions.create({
@@ -31,20 +31,38 @@ app.get("/template",async (req:Request, res:Response) => {
    const answer = response.choices[0].message?.content?.trim();
      if(answer == "react"){
         res.json({
-            prompts: [BASE_PROMPT,reactBasePrompt]
-        })
+             prompts: [BASE_PROMPT, `Here is an artifact that contains all files of the project visible to you.\nConsider the contents of ALL files in the project.\n\n${reactBasePrompt}\n\nHere is a list of files that exist on the file system but are not being shown to you:\n\n  - .gitignore\n  - package-lock.json\n`],
+              uiPrompts: [reactBasePrompt]
+            })
         return;
      }
      if(answer == "node"){
         res.json({
-             prompts:[nodeBasePrompt]
-        })
+           prompts: [`Here is an artifact that contains all files of the project visible to you.\nConsider the contents of ALL files in the project.\n\n${reactBasePrompt}\n\nHere is a list of files that exist on the file system but are not being shown to you:\n\n  - .gitignore\n  - package-lock.json\n`],
+           uiPrompts : [nodeBasePrompt]    
+          })
         return;
      }
          res.status(403).json({message: "You cant access this"})
      return;
 
 })
+  app.post("/chat",async(req:Request, res:Response) => {
+      
+    const messages = req.body.messages;
+    const response = await client.chat.completions.create({
+           model: "gpt-4",
+          messages : [
+            {role: "system", content: getSystemPrompt()},
+            ...messages  
+          ],
+            max_tokens: 1000,     
+    });
+      res.json({
+    response: response.choices[0]?.message?.content,
+  });
+  });
+
 app.listen(3000)
 
     

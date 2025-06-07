@@ -1,505 +1,315 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import { StepsList } from '../components/StepsList';
 import { FileExplorer } from '../components/FileExplorer';
 import { TabView } from '../components/TabView';
 import { CodeEditor } from '../components/CodeEditor';
 import { PreviewFrame } from '../components/PreviewFrame';
-import { Loader } from '../components/Loader';
 import type { Step, FileItem } from '../types';
 import { StepType } from '../types';
 import axios from 'axios';
 import { BACKEND_URL } from '../config';
 import { parseXml } from '../steps';
 import { useWebContainer } from '../hooks/useWebContainer';
-import type { FileSystemTree } from '@webcontainer/api';
-
-interface LLMMessage {
-  role: "user" | "assistant";
-  content: string;
-}
+import { Loader } from '../components/Loader';
 
 export function Builder() {
   const location = useLocation();
   const { prompt } = location.state as { prompt: string };
-  
-  // State management
-  const [userPrompt, setUserPrompt] = useState("");
-  const [llmMessages, setLlmMessages] = useState<LLMMessage[]>([]);
+  const [userPrompt, setPrompt] = useState("");
+  const [llmMessages, setLlmMessages] = useState<{role: "user" | "assistant", content: string}[]>([]);
   const [loading, setLoading] = useState(false);
   const [templateSet, setTemplateSet] = useState(false);
+  
+  // Use the updated hook
+  const { webContainer, isLoading: webContainerLoading, error: webContainerError } = useWebContainer();
+
   const [currentStep, setCurrentStep] = useState(1);
   const [activeTab, setActiveTab] = useState<'code' | 'preview'>('code');
   const [selectedFile, setSelectedFile] = useState<FileItem | null>(null);
+  
   const [steps, setSteps] = useState<Step[]>([]);
   const [files, setFiles] = useState<FileItem[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [debugInfo, setDebugInfo] = useState<string[]>([]);
-  
-  const webcontainer = useWebContainer();
 
-  // Debug logger
-  const addDebugInfo = useCallback((message: string) => {
-    console.log('[DEBUG]', message);
-    setDebugInfo(prev => [...prev.slice(-9), `${new Date().toLocaleTimeString()}: ${message}`]);
-  }, []);
+  useEffect(() => {
+    const originalFiles = [...files];
+    let updateHappened = false;
+    
+    steps.filter(({status}) => status === "pending").forEach(step => {
+      updateHappened = true;
+      if (step?.type === StepType.CreateFile) {
+        const parsedPath = step.path?.split("/") ?? [];
+        let currentFileStructure = [...originalFiles];
+        const finalAnswerRef = currentFileStructure;
 
-  // Process pending steps and update file structure
-  const processSteps = useCallback(() => {
-    const pendingSteps = steps.filter(step => step.status === "pending");
-    if (pendingSteps.length === 0) return;
+        let currentFolder = "";
+        const pathCopy = [...parsedPath];
+        
+        while(pathCopy.length) {
+          currentFolder = `${currentFolder}/${pathCopy[0]}`;
+          const currentFolderName = pathCopy[0];
+          pathCopy.splice(0, 1);
 
-    addDebugInfo(`Processing ${pendingSteps.length} pending steps`);
+          if (!pathCopy.length) {
+            // final file
+            const existingFile = currentFileStructure.find(x => x.path === currentFolder);
+            if (!existingFile) {
+              currentFileStructure.push({
+                name: currentFolderName,
+                type: 'file',
+                path: currentFolder,
+                content: step.code
+              });
+            } else {
+              existingFile.content = step.code;
+            }
+          } else {
+            // in a folder
+            const existingFolder = currentFileStructure.find(x => x.path === currentFolder);
+            if (!existingFolder) {
+              // create the folder
+              currentFileStructure.push({
+                name: currentFolderName,
+                type: 'folder',
+                path: currentFolder,
+                children: []
+              });
+            }
 
-    setFiles(currentFiles => {
-      let updatedFiles = [...currentFiles];
-      
-      pendingSteps.forEach(step => {
-        if (step.type === StepType.CreateFile && step.path) {
-          addDebugInfo(`Creating/updating file: ${step.path}`);
-          updatedFiles = createOrUpdateFile(updatedFiles, step.path, step.code || '');
+            const foundFolder = currentFileStructure.find(x => x.path === currentFolder);
+            if (foundFolder?.children) {
+              currentFileStructure = foundFolder.children;
+            }
+          }
         }
-      });
-      
-      return updatedFiles;
+        
+        if (updateHappened) {
+          setFiles(finalAnswerRef);
+        }
+      }
     });
 
-    // Mark steps as completed
-    setSteps(currentSteps => 
-      currentSteps.map(step => ({
-        ...step,
-        status: step.status === "pending" ? "completed" : step.status
-      }))
-    );
-  }, [steps, addDebugInfo]);
-
-  // Helper function to create or update files in the file structure
-  const createOrUpdateFile = (fileStructure: FileItem[], filePath: string, content: string): FileItem[] => {
-    const pathParts = filePath.split('/').filter(Boolean);
-    const updatedStructure = [...fileStructure];
-    
-    let currentLevel = updatedStructure;
-    let currentPath = '';
-    
-    for (let i = 0; i < pathParts.length; i++) {
-      const part = pathParts[i];
-      currentPath += `/${part}`;
-      const isLastPart = i === pathParts.length - 1;
-      
-      let existingItem = currentLevel.find(item => item.name === part);
-      
-      if (isLastPart) {
-        // This is a file
-        if (existingItem) {
-          existingItem.content = content;
-        } else {
-          currentLevel.push({
-            name: part,
-            type: 'file',
-            path: currentPath,
-            content
-          });
-        }
-      } else {
-        // This is a folder
-        if (!existingItem) {
-          existingItem = {
-            name: part,
-            type: 'folder',
-            path: currentPath,
-            children: []
-          };
-          currentLevel.push(existingItem);
-        }
-        currentLevel = existingItem.children!;
-      }
+    if (updateHappened) {
+      setSteps(prevSteps => prevSteps.map((s: Step) => ({
+        ...s,
+        status: "completed" as const
+      })));
     }
-    
-    return updatedStructure;
-  };
+  }, [steps]);
 
-  // Create WebContainer mount structure
-  const mountStructure = useMemo(() => {
-    const createMountStructure = (files: FileItem[]): FileSystemTree => {
-      const structure: FileSystemTree = {};
-      
-      files.forEach(file => {
-        if (file.type === 'folder' && file.children) {
-          structure[file.name] = {
-            directory: createMountStructure(file.children)
-          };
+  useEffect(() => {
+    // Only mount files when webContainer is ready and we have files
+    if (!webContainer || files.length === 0) return;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const createMountStructure = (files: FileItem[]): Record<string, any> => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const mountStructure: Record<string, any> = {};
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const processFile = (file: FileItem, isRootFolder: boolean): any => {  
+        if (file.type === 'folder') {
+          const directoryContent = file.children ? 
+            Object.fromEntries(
+              file.children.map(child => [child.name, processFile(child, false)])
+            ) 
+            : {};
+          
+          if (isRootFolder) {
+            mountStructure[file.name] = {
+              directory: directoryContent
+            };
+          } else {
+            return {
+              directory: directoryContent
+            };
+          }
         } else if (file.type === 'file') {
-          structure[file.name] = {
+          const fileContent = {
             file: {
               contents: file.content || ''
             }
           };
+          
+          if (isRootFolder) {
+            mountStructure[file.name] = fileContent;
+          } else {
+            return fileContent;
+          }
         }
-      });
-      
-      return structure;
+
+        return mountStructure[file.name];
+      };
+
+      files.forEach(file => processFile(file, true));
+      return mountStructure;
     };
-    
-    return createMountStructure(files);
-  }, [files]);
-
-  // Mount files to WebContainer
-  useEffect(() => {
-    if (webcontainer && Object.keys(mountStructure).length > 0) {
-      addDebugInfo(`Mounting ${Object.keys(mountStructure).length} items to WebContainer`);
-      webcontainer.mount(mountStructure).catch(err => {
-        addDebugInfo(`WebContainer mount error: ${err.message}`);
-      });
-    }
-  }, [webcontainer, mountStructure, addDebugInfo]);
-
-  // Process pending steps
-  useEffect(() => {
-    processSteps();
-  }, [processSteps]);
-
-  // Send chat message
-  const sendMessage = useCallback(async () => {
-    if (!userPrompt.trim() || loading) {
-      addDebugInfo('Send message blocked: empty prompt or already loading');
-      return;
-    }
-
-    const newMessage: LLMMessage = {
-      role: "user",
-      content: userPrompt.trim()
-    };
-
-    addDebugInfo(`Sending message: "${userPrompt.trim().substring(0, 50)}..."`);
-    addDebugInfo(`Backend URL: ${BACKEND_URL}`);
-    
-    setLoading(true);
-    setUserPrompt("");
-    setError(null);
 
     try {
-      const requestData = {
-        messages: [...llmMessages, newMessage]
-      };
-      
-      addDebugInfo(`Request payload: ${JSON.stringify(requestData).substring(0, 100)}...`);
-      
-      const response = await axios.post(`${BACKEND_URL}/chat`, requestData, {
-        timeout: 30000, // 30 second timeout
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      });
-
-      addDebugInfo(`Response status: ${response.status}`);
-      addDebugInfo(`Response data keys: ${Object.keys(response.data)}`);
-
-      if (!response.data.response) {
-        throw new Error('No response field in backend response');
-      }
-
-      const assistantMessage: LLMMessage = {
-        role: "assistant",
-        content: response.data.response
-      };
-
-      setLlmMessages(prev => [...prev, newMessage, assistantMessage]);
-      
-      try {
-        const newSteps = parseXml(response.data.response).map((step: Step) => ({
-          ...step,
-          status: "pending" as const
-        }));
-        
-        addDebugInfo(`Parsed ${newSteps.length} steps from response`);
-        setSteps(prev => [...prev, ...newSteps]);
-      } catch (parseError) {
-        const errorMessage = parseError instanceof Error ? parseError.message : String(parseError);
-        addDebugInfo(`XML parsing error: ${errorMessage}`);
-        // Continue without adding steps if parsing fails
-      }
+      const mountStructure = createMountStructure(files);
+      console.log('Mounting structure:', mountStructure);
+      webContainer.mount(mountStructure);
     } catch (error) {
-      console.error('Error sending message:', error);
-      let errorMessage = 'Unknown error occurred';
-      
-      if (axios.isAxiosError(error)) {
-        if (error.code === 'ECONNABORTED') {
-          errorMessage = 'Request timeout - backend not responding';
-        } else if (error.response) {
-          errorMessage = `Backend error: ${error.response.status} - ${error.response.data?.message || error.response.statusText}`;
-        } else if (error.request) {
-          errorMessage = 'No response from backend - check if backend is running and accessible';
-        } else {
-          errorMessage = `Request setup error: ${error.message}`;
-        }
-      } else {
-        errorMessage = error instanceof Error ? error.message : String(error);
-      }
-      
-      addDebugInfo(`Error: ${errorMessage}`);
-      setError(errorMessage);
-    } finally {
-      setLoading(false);
+      console.error('Failed to mount files:', error);
     }
-  }, [userPrompt, loading, llmMessages, addDebugInfo]);
+  }, [files, webContainer]);
 
-  // Initialize the builder
-  const initializeBuilder = useCallback(async () => {
-    if (!prompt?.trim()) {
-      addDebugInfo('Initialize blocked: no prompt provided');
-      return;
-    }
-
-    addDebugInfo(`Initializing builder with prompt: "${prompt.trim().substring(0, 50)}..."`);
-    addDebugInfo(`Backend URL: ${BACKEND_URL}`);
-    
-    setLoading(true);
-    setError(null);
-    
+  const init = async () => {
     try {
-      // Get template
-      addDebugInfo('Requesting template from backend...');
-      const templateResponse = await axios.post(`${BACKEND_URL}/template`, {
+      const response = await axios.post(`${BACKEND_URL}/template`, {
         prompt: prompt.trim()
-      }, {
-        timeout: 30000,
-        headers: {
-          'Content-Type': 'application/json'
-        }
       });
-      
-      addDebugInfo(`Template response status: ${templateResponse.status}`);
-      addDebugInfo(`Template response keys: ${Object.keys(templateResponse.data)}`);
-      
       setTemplateSet(true);
-      const { prompts, uiPrompts } = templateResponse.data;
+      
+      const {prompts, uiPrompts} = response.data;
 
-      if (!prompts || !uiPrompts) {
-        throw new Error('Invalid template response: missing prompts or uiPrompts');
-      }
+      setSteps(parseXml(uiPrompts[0]).map((x: Step) => ({
+        ...x,
+        status: "pending" as const
+      })));
 
-      // Set initial steps from UI prompts
-      try {
-        const initialSteps = parseXml(uiPrompts[0]).map((step: Step) => ({
-          ...step,
-          status: "pending" as const
-        }));
-        addDebugInfo(`Parsed ${initialSteps.length} initial steps from UI prompts`);
-        setSteps(initialSteps);
-      } catch (parseError) {
-        const errorMessage = parseError instanceof Error ? parseError.message : String(parseError);
-        addDebugInfo(`UI prompts parsing error: ${errorMessage}`);
-      }
+      setLoading(true);
+      const stepsResponse = await axios.post(`${BACKEND_URL}/chat`, {
+        messages: [...prompts, prompt].map((content: string) => ({
+          role: "user" as const,
+          content
+        }))
+      });
 
-      // Get chat response
-      const messages = [...prompts, prompt].map(content => ({
+      setLoading(false);
+
+      setSteps(s => [...s, ...parseXml(stepsResponse.data.response).map((x: Step) => ({
+        ...x,
+        status: "pending" as const
+      }))]);
+
+      const initialMessages = [...prompts, prompt].map((content: string) => ({
         role: "user" as const,
         content
       }));
-
-      addDebugInfo(`Sending ${messages.length} messages to chat endpoint...`);
-      const chatResponse = await axios.post(`${BACKEND_URL}/chat`, {
-        messages
-      }, {
-        timeout: 30000,
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      });
-
-      addDebugInfo(`Chat response status: ${chatResponse.status}`);
-
-      if (!chatResponse.data.response) {
-        throw new Error('No response field in chat response');
-      }
-
-      const assistantResponse = {
-        role: "assistant" as const,
-        content: chatResponse.data.response
-      };
-
-      setLlmMessages([...messages, assistantResponse]);
-
-      // Add chat response steps
-      try {
-        const chatSteps = parseXml(chatResponse.data.response).map((step: Step) => ({
-          ...step,
-          status: "pending" as const
-        }));
-        
-        addDebugInfo(`Parsed ${chatSteps.length} steps from chat response`);
-        setSteps(prev => [...prev, ...chatSteps]);
-      } catch (parseError) {
-        const errorMessage = parseError instanceof Error ? parseError.message : String(parseError);
-        addDebugInfo(`Chat response parsing error: ${errorMessage}`);
-      }
-
-      addDebugInfo('Builder initialization completed successfully');
+      
+      setLlmMessages(initialMessages);
+      setLlmMessages(x => [...x, {role: "assistant", content: stepsResponse.data.response}]);
     } catch (error) {
-      console.error('Error initializing builder:', error);
-      let errorMessage = 'Unknown initialization error';
+      console.error('Initialization failed:', error);
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    init();
+  }, []);
+
+  const handleSendMessage = async () => {
+    if (!userPrompt.trim()) return;
+    
+    const newMessage = {
+      role: "user" as const,
+      content: userPrompt
+    };
+
+    try {
+      setLoading(true);
+      const stepsResponse = await axios.post(`${BACKEND_URL}/chat`, {
+        messages: [...llmMessages, newMessage]
+      });
       
-      if (axios.isAxiosError(error)) {
-        if (error.code === 'ECONNABORTED') {
-          errorMessage = 'Initialization timeout - backend not responding';
-        } else if (error.response) {
-          errorMessage = `Backend initialization error: ${error.response.status} - ${error.response.data?.message || error.response.statusText}`;
-        } else if (error.request) {
-          errorMessage = 'No response from backend during initialization - check if backend is running';
-        } else {
-          errorMessage = `Initialization setup error: ${error.message}`;
-        }
-      } else {
-        errorMessage = error instanceof Error ? error.message : String(error);
-      }
+      setLlmMessages(x => [...x, newMessage, {
+        role: "assistant",
+        content: stepsResponse.data.response
+      }]);
       
-      addDebugInfo(`Initialization error: ${errorMessage}`);
-      setError(errorMessage);
+      setSteps(s => [...s, ...parseXml(stepsResponse.data.response).map((x: Step) => ({
+        ...x,
+        status: "pending" as const
+      }))]);
+      
+      setPrompt("");
+    } catch (error) {
+      console.error('Failed to send message:', error);
     } finally {
       setLoading(false);
     }
-  }, [prompt, addDebugInfo]);
+  };
 
-  // Initialize on mount
-  useEffect(() => {
-    addDebugInfo('Component mounted, starting initialization...');
-    initializeBuilder();
-  }, [initializeBuilder]);
-
-  // Handle keyboard shortcuts
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.key === 'Enter') {
-        e.preventDefault();
-        sendMessage();
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [sendMessage]);
-
-  if (loading && !templateSet) {
+  // Show error if WebContainer failed to load
+  if (webContainerError) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-screen bg-gray-900 text-white p-8">
-        <Loader />
-        <div className="mt-8 w-full max-w-2xl">
-          <h3 className="text-lg font-semibold mb-4">Debug Information:</h3>
-          <div className="bg-gray-800 p-4 rounded-lg max-h-64 overflow-y-auto">
-            {debugInfo.map((info, index) => (
-              <div key={index} className="text-sm text-gray-300 mb-1">{info}</div>
-            ))}
-          </div>
-          {error && (
-            <div className="mt-4 p-4 bg-red-900 border border-red-700 rounded-lg">
-              <h4 className="font-semibold text-red-300">Error:</h4>
-              <p className="text-red-200">{error}</p>
-            </div>
-          )}
+      <div className="min-h-screen bg-gray-900 flex items-center justify-center">
+        <div className="text-red-400 text-center">
+          <h2 className="text-xl font-semibold mb-2">WebContainer Error</h2>
+          <p>{webContainerError}</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col h-screen bg-gray-900 text-white">
-      {/* Debug panel */}
-      {debugInfo.length > 0 && (
-        <div className="bg-gray-800 border-b border-gray-700 p-2">
-          <details className="text-sm">
-            <summary className="cursor-pointer text-gray-400 hover:text-white">
-              Debug Info ({debugInfo.length})
-            </summary>
-            <div className="mt-2 max-h-32 overflow-y-auto">
-              {debugInfo.slice(-5).map((info, index) => (
-                <div key={index} className="text-xs text-gray-300">{info}</div>
-              ))}
-            </div>
-          </details>
-        </div>
-      )}
-
-      {error && (
-        <div className="bg-red-900 border-b border-red-700 p-3">
-          <div className="flex justify-between items-center">
-            <span className="text-red-200">{error}</span>
-            <button 
-              onClick={() => setError(null)}
-              className="text-red-300 hover:text-red-100"
-            >
-              ×
-            </button>
-          </div>
-        </div>
-      )}
-
-      <div className="flex-1 flex overflow-hidden">
-        {/* Left sidebar */}
-        <div className="w-64 bg-gray-800 border-r border-gray-700">
-          <FileExplorer
-            files={files}
-            onFileSelect={setSelectedFile}
-          />
-        </div>
-
-        {/* Main content */}
-        <div className="flex-1 flex flex-col">
-          {/* Tabs */}
-          <TabView
-            activeTab={activeTab}
-            onTabChange={setActiveTab}
-          />
-
-          {/* Content area */}
-          <div className="flex-1 overflow-hidden">
-            {activeTab === 'code' ? (
-              <CodeEditor
-                file={selectedFile}
-              />
-            ) : (
-              webcontainer && (
-                <PreviewFrame
-                  files={files}
-                  webContainer={webcontainer}
+    <div className="min-h-screen bg-gray-900 flex flex-col">
+      <header className="bg-gray-800 border-b border-gray-700 px-6 py-4">
+        <h1 className="text-xl font-semibold text-gray-100">Website Builder</h1>
+        <p className="text-sm text-gray-400 mt-1">Prompt: {prompt}</p>
+        {webContainerLoading && (
+          <p className="text-xs text-yellow-400 mt-1">Loading WebContainer...</p>
+        )}
+      </header>
+      
+      <div className="flex-1 overflow-hidden">
+        <div className="h-full grid grid-cols-4 gap-6 p-6">
+          <div className="col-span-1 space-y-6 overflow-auto">
+            <div>
+              <div className="max-h-[75vh] overflow-scroll">
+                <StepsList
+                  steps={steps}
+                  currentStep={currentStep}
+                  onStepClick={setCurrentStep}
                 />
-              )
-            )}
+              </div>
+              <div>
+                <div className='flex'>
+                  <br />
+                  {(loading || !templateSet) && <Loader />}
+                  {!(loading || !templateSet) && (
+                    <div className='flex'>
+                      <textarea 
+                        value={userPrompt} 
+                        onChange={(e) => setPrompt(e.target.value)} 
+                        className='p-2 w-full'
+                        placeholder="Enter your message..."
+                      />
+                      <button 
+                        onClick={handleSendMessage} 
+                        className='bg-purple-400 px-4'
+                        disabled={loading || !userPrompt.trim()}
+                      >
+                        Send
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
           </div>
-        </div>
-
-        {/* Right sidebar */}
-        <div className="w-80 bg-gray-800 border-l border-gray-700">
-          <StepsList
-            steps={steps}
-            currentStep={currentStep}
-            onStepClick={setCurrentStep}
-          />
-        </div>
-      </div>
-
-      {/* Chat input */}
-      <div className="h-16 bg-gray-800 border-t border-gray-700 p-4">
-        <div className="flex gap-2">
-          <input
-            type="text"
-            value={userPrompt}
-            onChange={(e) => setUserPrompt(e.target.value)}
-            placeholder="Type your message..."
-            className="flex-1 bg-gray-700 text-white rounded px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.ctrlKey) {
-                e.preventDefault();
-                sendMessage();
-              }
-            }}
-          />
-          <button
-            onClick={sendMessage}
-            disabled={loading}
-            className="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
-          >
-            {loading ? 'Sending...' : 'Send'}
-          </button>
+          <div className="col-span-1">
+            <FileExplorer 
+              files={files} 
+              onFileSelect={setSelectedFile}
+            />
+          </div>
+          <div className="col-span-2 bg-gray-900 rounded-lg shadow-lg p-4 h-[calc(100vh-8rem)]">
+            <TabView activeTab={activeTab} onTabChange={setActiveTab} />
+            <div className="h-[calc(100%-4rem)]">
+              {activeTab === 'code' ? (
+                <CodeEditor file={selectedFile} />
+              ) : (
+                <PreviewFrame 
+                  webContainer={webContainer} 
+                  files={files} 
+                  isLoading={webContainerLoading}
+                />
+              )}
+            </div>
+          </div>
         </div>
       </div>
     </div>
